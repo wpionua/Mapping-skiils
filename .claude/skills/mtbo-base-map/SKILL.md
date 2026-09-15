@@ -139,9 +139,10 @@ python $S speed --config project.json --tracks D:/rides \
 **Input is a folder of tracks**, pointed at with `--tracks` (or `tracks_dir` in
 the config, set by `init --tracks-dir`). Hand it the rider's whole archive: every
 `.gpx` under it is read, and those that do not cross this map are dropped, which
-is normally almost all of them. Files are also accepted individually or as globs,
-and the JSON stream dicts a Strava MCP connector returns work alongside `.gpx` in
-the same folder.
+is normally almost all of them. Files are also accepted individually or as globs, and a
+`.json` holding the same arrays (`location`, `time`, `velocity_smooth`,
+`grade_smooth`, `moving`, `heart_rate`, `watts`) is read alongside `.gpx` in the
+same folder, for devices or exports that already provide smoothed values.
 
 What each track needs, in order of how much it buys:
 
@@ -160,7 +161,7 @@ What each track needs, in order of how much it buys:
 1 Hz, so speed is taken over a centred +/-`--speed-win` sample window and gradient
 over `--grade-m` of ground distance on a profile smoothed with `--ele-smooth`.
 The defaults (3 / 60 m / 15) are not arbitrary: measured against the same rides
-delivered as pre-smoothed Strava streams, they cut the worst per-way disagreement
+delivered as pre-smoothed device streams, they cut the worst per-way disagreement
 from 10.5 to 5.2 km/h and lifted band agreement from 59 % to 76 %. Smoothing
 harder is *not* better - 120 m windows fell back to 65 %. Where a device already
 supplies smoothed speed and gradient that route stays the more accurate one;

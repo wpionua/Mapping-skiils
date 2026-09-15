@@ -1613,7 +1613,7 @@ def _haversine(a, b):
 
 
 def read_gpx(path, smooth_ele=9, speed_win=2, grade_m=30.0, min_kmh=3.0, gap_s=10):
-    """GPX -> the same stream dict the Strava connector returns.
+    """GPX -> the stream dict the rest of this step expects.
 
     Heart rate and power come from the Garmin TrackPointExtension where the
     device wrote them. Speed and grade have to be derived, and both are noisy at
@@ -1716,8 +1716,7 @@ def load_tracks(specs, clip, frame, min_in_area=10, smooth_ele=9,
     """Every track in the given folders/files, keeping only those in the map.
 
     A rider's archive is mostly elsewhere; this is what filters it down to the
-    area being mapped. Accepts .gpx and the JSON stream dicts the Strava MCP
-    connector returns, mixed freely.
+    area being mapped. Accepts .gpx and .json stream dicts, mixed freely.
     """
     from shapely.geometry import Point
     paths = []
@@ -2288,8 +2287,8 @@ def main():
     p.add_argument("--config", default="project.json")
     p.add_argument("--tracks", nargs="+",
                    help="folder(s) of GPS tracks, or single files/globs. .gpx and "
-                        "the JSON stream dicts the Strava MCP connector returns are "
-                        "both accepted; tracks outside the map are skipped")
+                        ".json stream dicts are both accepted; tracks outside "
+                        "the map are skipped")
     p.add_argument("--streams", nargs="+", help="deprecated alias for --tracks")
     p.add_argument("--ele-smooth", type=int, default=15,
                    help="GPX only: elevation moving-average window, samples")
