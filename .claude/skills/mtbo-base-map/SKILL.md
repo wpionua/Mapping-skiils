@@ -1,6 +1,6 @@
 ---
 name: mtbo-base-map
-description: Build a base MTBO map (ISMTBOM 2022, 1:15 000) for an area from open data - OpenStreetMap for the path network and features, Copernicus DEM for 5 m contours, several dates of Sentinel-2 plus ESA WorldCover for vegetation, and optionally a Strava global-heatmap screenshot to confirm and extend the rides. Produces an OpenOrienteering Mapper .omap restricted to ISMTBOM 2022 symbols. Use when asked to make an MTBO map for a region, digitise a heatmap into a map, build a base/draft map from OSM, add contours, or derive vegetation from satellite imagery.
+description: Build a base MTBO map (ISMTBOM 2022, 1:15 000) for an area from open data - OpenStreetMap for the path network and features, Copernicus DEM for 5 m contours, several dates of Sentinel-2 plus ESA WorldCover for vegetation, and optionally a Strava global-heatmap screenshot to confirm and extend the rides. The rider's own GPS tracks (Strava MCP activity streams) can replace the inferred riding-speed classes with measured ones: flat-equivalent speed at a reference power, solved through a cycling power model. Produces an OpenOrienteering Mapper .omap restricted to ISMTBOM 2022 symbols. Use when asked to make an MTBO map for a region, digitise a heatmap into a map, build a base/draft map from OSM, add contours, derive vegetation from satellite imagery, or classify paths by measured riding speed from Strava rides, power or heart-rate data.
 ---
 
 # OSM (+ Strava heatmap) -> ISMTBOM 2022 base map
@@ -34,6 +34,10 @@ Also settle, if the user has not said:
 * **contours** - yes/no and interval (default 5 m, index every 25 m);
 * **vegetation** - yes/no. It needs one summer and one winter satellite pass and
   gives 406 / 401 / 308 areas; without it the forest is plain white.
+* **own GPS tracks** - has the user ridden the area, and is the Strava MCP
+  connector available? Their rides turn the riding-speed classes from a tag guess
+  into a measurement (the `speed` step). Ask what speed counts as a good, fast
+  track - that one number anchors the whole 815-822 ladder.
 * the **donor symbol set**: an ISMTBOM 2022 `.omap` at the target scale to take
   the colour table and symbols from. Mapper ships no ISMTBOM 2022 set
   ([issue #1107]), so this is usually a set produced by `mtbo-map-conversion`.
@@ -55,6 +59,7 @@ python $S heatmap      # screenshot -> data/heatmap_network.json + overlay  (ski
 python $S contours     # Copernicus GLO-30 -> data/contours.json            (network)
 python $S imagery      # Sentinel-2, several dates -> data/satellite.png + s2_stack.npz
 python $S vegetation   # WorldCover + seasonal NDVI -> data/vegetation.json
+python $S speed        # GPS tracks -> data/speeds.json     (measured riding speed)
 python $S build        # -> the .omap, _report.txt, _merge_check.png
 python $S render       # -> _preview.png   (Mapper 0.9.x has no headless export)
 ```
@@ -117,6 +122,65 @@ With a heatmap, `build` does three things:
 
 Set `"upgrade_confirmed": false` in `project.json` if the user wants the OSM tags
 taken at face value.
+
+## Measured riding speed - the `speed` step
+
+The tag ladder above says what a path is *made of*; 815-822 record how fast you
+*ride* it. With the rider's own GPS tracks that stops being a guess.
+
+```bash
+python $S speed --config project.json \
+    --streams data/streams/*.json \
+    --v-ref 30 --bands 28,13.5,6 --p-ref 228 --hr-lo 160 --hr-hi 180
+```
+
+Input is one JSON file per ride holding Strava activity streams - `location`,
+`time`, `velocity_smooth`, `grade_smooth`, `moving`, and `heart_rate` and `watts`
+where they exist. The official **Strava MCP connector** produces exactly this from
+`get_activity_streams`; save each result to `data/streams/ride_<id>.json`. Find the
+rides that touch the map by listing activities with `include_polyline` and decoding
+the polyline against the map bbox - most of an athlete's rides will be elsewhere.
+
+**What it computes.** Raw GPS speed conflates three things - the terrain, the
+gradient, and how hard the rider was trying. Remove the last two:
+
+1. **effort** - keep only samples inside a heart-rate band (hard but steady).
+   Heart rate lags its cause, so the stream is shifted back `--hr-lag` (25 s).
+2. **gradient, and the surface** - with a power meter, invert a cycling power
+   model at the measured watts, speed and grade to get the path's **effective
+   rolling resistance**, *including* an acceleration term (`m*a*v`); without it a
+   forest ride's constant surging is charged to the surface and crr comes out
+   two to three times too high. Then put that crr back into the model at a
+   **reference power** (the athlete's FTP) on zero gradient and solve for speed.
+
+The answer is "how fast does this path let you ride, on the flat, at threshold".
+Rolling resistance is deliberately **not** held constant - it is the signal. On a
+real forest map it ranged 0.012 on smooth tracks to 0.033 on rough ones, and the
+band boundary that matters falls between those populations rather than through one.
+
+Without a power meter only the gradient is normalised away, against the nominal
+`--crr`; then heart rate carries the whole effort control.
+
+**Bands.** `--bands` takes km/h thresholds directly (fast, medium, slow), so the
+config says what the user said. Ask them to anchor it: "what speed is a good, fast
+track?" Beware that a threshold set too low puts every measured way in one band and
+the classification stops discriminating - on the Bryukhovychi map, 22.5 km/h made
+18 of 19 ways "fast", while 28 km/h split them 8 fast / 11 medium. Print the
+measured distribution before settling it.
+
+**Evidence gating.** A way needs `--min-pts` (12) samples from `--min-traces`
+rides before a measurement may override its tag. Matching is nearest way within
+`--match-m` (12 m) *and* aligned within `--heading-deg` (40 deg), so a parallel
+track does not steal the samples. Expect a third to a half of samples to match
+nothing: some is GPS scatter under canopy, but much of it is trail OSM does not
+have - a useful hint about where the map is incomplete.
+
+In `build` a measured way outranks both the tag guess and the heatmap: it
+has its heatmap upgrade suppressed (`"speed_overrides_heat"`), because a
+measurement should never compete with an inference. Every reclassified way goes
+into the report with its speed and sample count.
+
+It is still one rider on a handful of days. Say so; a surveyor will move some of it.
 
 ## Contours
 
@@ -258,8 +322,9 @@ the merge overlay: OSM lines sit on the heat corridors
 ## Files
 
 * `scripts/mtbo_base.py` - the whole pipeline (`init`/`fetch`/`heatmap`/`contours`/
-  `imagery`/`vegetation`/`build`/`render`), the ISMTBOM 2022 code list, the OSM
-  classification, the heatmap merge and the vegetation classifier.
+  `imagery`/`vegetation`/`speed`/`build`/`render`), the ISMTBOM 2022 code list, the
+  OSM classification, the heatmap merge, the vegetation classifier and the
+  cycling power model.
 * `scripts/render_omap.py` - rough raster preview of any `.omap`.
 * `reference/osm-mapping.md` - the full OSM tag -> ISMTBOM table, the speed-band
   ladder, the ISMTBOM 2022 code list and the non-spec equivalences.

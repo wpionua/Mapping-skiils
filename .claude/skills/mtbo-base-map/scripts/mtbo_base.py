@@ -28,7 +28,7 @@ Attribution / licence:
   * Riding-speed classes derived here are INFERRED from OSM tags and heatmap
     usage. They are not a survey.
 """
-import argparse, collections, io, json, math, os, re, sys, time
+import argparse, collections, glob, io, json, math, os, re, sys, time
 
 # ---------------------------------------------------------------- configuration
 DEFAULTS = {
@@ -49,6 +49,13 @@ DEFAULTS = {
     "vegetation_json": "data/vegetation.json", "vegetation": False,
     "satellite_template": True,
     "contour_min_len_m": 45.0,
+    # riding speed measured from GPS traces
+    "speeds_json": "data/speeds.json", "speeds": False,
+    "speed_v_ref_kmh": 30.0, "speed_bands": [0.75, 0.45, 0.20],
+    "speed_quantile": 0.75, "speed_hr_lo": 160, "speed_hr_hi": 180,
+    "speed_hr_lag_s": 25, "speed_p_ref_w": 228.0,
+    "speed_mass_kg": 85.0, "speed_crr": 0.012, "speed_cda": 0.42,
+    "speed_overrides_heat": True,
 }
 
 
@@ -1518,6 +1525,228 @@ def write_omap(cfg, colors, symbols, obj, frame):
     log(f"wrote {cfg['out']} ({len(xml)/1024:.0f} kB, {len(obj.parts)} objects)")
 
 
+# ---------------------------------------------------------------- riding speed
+# Flat-equivalent speed at a reference effort. Raw GPS speed conflates three
+# things -- the terrain, the gradient, and how hard the rider was trying -- so
+# fix the last two and what is left is a property of the path.
+#
+# With a power meter the physics is exact enough to be worth doing properly:
+#
+#   1. from measured power, speed and grade, solve for the path's EFFECTIVE
+#      ROLLING RESISTANCE. That single number carries the surface: mud, roots,
+#      sand and loose stone all show up as a higher crr_eff.
+#   2. put that crr_eff back into the same model at a REFERENCE POWER (the
+#      athlete's FTP by default) on zero gradient, and solve for speed.
+#
+# The answer is "how fast does this path let you ride, on the flat, at
+# threshold" -- which is what 815-822 encode. Without a power meter, power is
+# estimated from a nominal crr instead, and only the gradient is normalised
+# away; heart rate then has to carry the effort control, shifted back by
+# `hr_lag_s` because heart rate lags its cause by 20-30 s.
+#
+# It remains one rider on a handful of days. It is evidence, not a survey.
+G0, RHO = 9.80665, 1.225
+
+
+def power_at(v, grade, m, crr, cda):
+    """Watts to hold v m/s on a slope; steady state, no drivetrain loss."""
+    th = math.atan(grade)
+    return v * (crr * m * G0 * math.cos(th) + 0.5 * RHO * cda * v * v
+                + m * G0 * math.sin(th))
+
+
+def crr_from(p, v, grade, m, cda, accel=0.0):
+    """Invert the model for the rolling resistance the path must have had.
+
+    `accel` matters: a forest ride is a chain of surges and brakes, and without
+    the kinetic term every acceleration is charged to the surface instead.
+    """
+    th = math.atan(grade)
+    return (p / v - 0.5 * RHO * cda * v * v - m * G0 * math.sin(th)
+            - m * accel) / (m * G0 * math.cos(th))
+
+
+def flat_speed(p, m, crr, cda):
+    """Speed those watts give on the flat against that rolling resistance."""
+    lo, hi = 0.0, 30.0
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if power_at(mid, 0.0, m, crr, cda) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def cmd_speed(args):
+    from shapely.geometry import LineString, Point, box
+    from shapely.strtree import STRtree
+    import statistics
+    cfg = load_config(args.config)
+    frame = Frame(cfg["lat"], cfg["lon"])
+    hw, hh = cfg["extent_m"][0] / 2, cfg["extent_m"][1] / 2
+    clip = box(-hw, -hh, hw, hh)
+    for k, v in (("speed_v_ref_kmh", args.v_ref), ("speed_p_ref_w", args.p_ref),
+                 ("speed_hr_lo", args.hr_lo), ("speed_hr_hi", args.hr_hi),
+                 ("speed_quantile", args.quantile), ("speed_hr_lag_s", args.hr_lag),
+                 ("speed_mass_kg", args.mass), ("speed_crr", args.crr),
+                 ("speed_cda", args.cda)):
+        cfg[k] = v
+    if args.bands:
+        cfg["speed_bands"] = [float(x) / args.v_ref for x in args.bands.split(",")]
+    m, cda = cfg["speed_mass_kg"], cfg["speed_cda"]
+
+    # ---- the rideable network, keyed by OSM way id
+    osm = json.load(io.open(cfg["osm_json"], encoding="utf-8"))
+    geoms, ids, tagged = [], [], {}
+    for e in osm["elements"]:
+        if e["type"] != "way":
+            continue
+        t = e.get("tags") or {}
+        code, b, fam = classify_highway(t)
+        if not code or b is None:
+            continue
+        pts = [frame.fwd(p["lon"], p["lat"]) for p in (e.get("geometry") or []) if p]
+        if len(pts) < 2:
+            continue
+        g = LineString(pts)
+        if not g.intersects(clip):
+            continue
+        geoms.append(g)
+        ids.append(e["id"])
+        tagged[e["id"]] = {"code": code, "band": b, "fam": fam,
+                           "name": t.get("name", ""), "highway": t.get("highway", "")}
+    tree = STRtree(geoms)
+    log(f"network: {len(geoms)} rideable ways inside the map")
+
+    # ---- samples
+    paths = []
+    for spec in (args.streams or []):
+        paths += sorted(glob.glob(spec)) if any(c in spec for c in "*?") else [spec]
+    streams = []
+    for p in paths:
+        d = json.load(io.open(p, encoding="utf-8"))
+        if "location" in d:
+            streams.append((os.path.basename(p), d))
+        else:
+            log(f"  skip {os.path.basename(p)}: no location stream")
+    if not streams:
+        sys.exit("no usable stream files; pass --streams FILE_OR_GLOB")
+
+    per_way = collections.defaultdict(list)
+    kept = unmatched = 0
+    drop = collections.Counter()
+    for name, d in streams:
+        loc = d["location"]
+        tim = d.get("time") or list(range(len(loc)))
+        vel, grd = d.get("velocity_smooth"), d.get("grade_smooth")
+        hr, mov, watts = d.get("heart_rate"), d.get("moving"), d.get("watts")
+        byt = {t: i for i, t in enumerate(tim)}
+        n_file = 0
+        for i in range(1, len(loc)):
+            if mov and not mov[i]:
+                continue
+            v = vel[i] if vel else 0.0
+            if not (args.min_kmh / 3.6 <= v <= args.max_kmh / 3.6):
+                drop["speed out of range"] += 1
+                continue
+            if hr is not None and args.hr_lo > 0:
+                # heart rate lags its cause: pair speed at t with heart rate at t+lag
+                j = byt.get(tim[i] + cfg["speed_hr_lag_s"])
+                if j is None or not hr[j]:
+                    drop["no heart rate at t+lag"] += 1
+                    continue
+                if not (cfg["speed_hr_lo"] <= hr[j] <= cfg["speed_hr_hi"]):
+                    drop["heart rate outside band"] += 1
+                    continue
+            grade = (grd[i] / 100.0) if grd else 0.0
+            if watts and watts[i]:
+                p_meas = float(watts[i])
+                dt = max(1e-3, tim[i] - tim[i - 1])
+                accel = ((v - vel[i - 1]) / dt) if vel else 0.0
+                crr_eff = crr_from(p_meas, v, grade, m, cda, accel)
+                if not (args.crr_min <= crr_eff <= args.crr_max):
+                    drop["implausible rolling resistance"] += 1
+                    continue
+            else:                      # no power meter: gradient only, nominal surface
+                p_meas = power_at(v, grade, m, cfg["speed_crr"], cda)
+                crr_eff = cfg["speed_crr"]
+            if p_meas < args.min_watts:
+                drop["coasting"] += 1
+                continue
+            vf = flat_speed(cfg["speed_p_ref_w"], m, crr_eff, cda)
+            x, y = frame.fwd(loc[i][1], loc[i][0])
+            if not clip.contains(Point(x, y)):
+                continue
+            px, py = frame.fwd(loc[i - 1][1], loc[i - 1][0])
+            head = math.degrees(math.atan2(y - py, x - px))
+            pt = Point(x, y)
+            best, bestd = None, args.match_m
+            for k in tree.query(pt.buffer(args.match_m)):
+                g = geoms[k]
+                dist = g.distance(pt)
+                if dist > bestd:
+                    continue
+                s = g.project(pt)
+                a = g.interpolate(max(0.0, s - 3.0))
+                b2 = g.interpolate(min(g.length, s + 3.0))
+                wh = math.degrees(math.atan2(b2.y - a.y, b2.x - a.x))
+                off = abs((head - wh + 180) % 360 - 180)
+                if min(off, 180 - off) > args.heading_deg:   # a parallel way, not this one
+                    continue
+                best, bestd = k, dist
+            if best is None:
+                unmatched += 1
+                continue
+            per_way[ids[best]].append((vf * 3.6, crr_eff, name))   # speed kept for reference
+            kept, n_file = kept + 1, n_file + 1
+        log(f"  {name}: {n_file} samples matched"
+            + ("" if watts else "  (no power meter: gradient-only normalisation)"))
+    log(f"kept {kept}, unmatched {unmatched}; dropped " +
+        ", ".join(f"{k} {v}" for k, v in drop.most_common()))
+
+    # ---- aggregate per way and classify
+    vref, fr = cfg["speed_v_ref_kmh"], cfg["speed_bands"]
+    ways, changed = {}, 0
+    for wid, rows in per_way.items():
+        traces = {r[2] for r in rows}
+        if len(rows) < args.min_pts or len(traces) < args.min_traces:
+            drop["way below evidence threshold"] += 1
+            continue
+        # the path has one effective rolling resistance, so take a quantile of
+        # THAT and derive a single speed from it -- a quantile of the per-sample
+        # speeds would not correspond to the crr reported beside it.
+        cs = sorted(r2[1] for r2 in rows)
+        crr_q = cs[min(len(cs) - 1, int((1.0 - cfg["speed_quantile"]) * len(cs)))]
+        kmh = flat_speed(cfg["speed_p_ref_w"], m, crr_q, cda) * 3.6
+        r = kmh / vref
+        b = FAST if r >= fr[0] else MED if r >= fr[1] else SLOW if r >= fr[2] else VSLOW
+        old = tagged[wid]
+        ways[str(wid)] = {"kmh": round(kmh, 1), "ratio": round(r, 2), "band": b,
+                          "crr": round(crr_q, 4),
+                          "crr_median": round(statistics.median(cs), 4),
+                          "n": len(rows), "traces": len(traces),
+                          "was": old["code"], "code": code_for(old["fam"], b),
+                          "highway": old["highway"], "name": old["name"]}
+        changed += b != old["band"]
+    cfg["speeds"] = True
+    cfg["speeds_json"] = args.speeds_json or cfg.get("speeds_json", "data/speeds.json")
+    save_config(args.config, cfg)
+    io.open(cfg["speeds_json"], "w", encoding="utf-8").write(json.dumps(
+        {"v_ref_kmh": vref, "p_ref_w": cfg["speed_p_ref_w"], "bands": fr,
+         "quantile": cfg["speed_quantile"],
+         "hr_band": [cfg["speed_hr_lo"], cfg["speed_hr_hi"]],
+         "hr_lag_s": cfg["speed_hr_lag_s"],
+         "model": {"mass_kg": m, "cda": cda, "crr_nominal": cfg["speed_crr"]},
+         "traces": [s[0] for s in streams], "ways": ways}, indent=1))
+    log(f"{len(ways)} ways measured, {changed} differ from their OSM-tag class"
+        f" -> {cfg['speeds_json']}")
+    for wid, w in sorted(ways.items(), key=lambda kv: -kv[1]["kmh"]):
+        flag = "  <-- changed" if w["was"] != w["code"] else ""
+        log(f"  {w['was']:>5} -> {w['code']:>5}  {w['kmh']:5.1f} km/h  crr {w['crr']:.3f}  "
+            f"n={w['n']:3d}/{w['traces']}  {w['highway']} {w['name']}{flag}")
+
+
 # ---------------------------------------------------------------- build
 def cmd_build(args):
     from shapely.geometry import LineString, Point, Polygon, box
@@ -1592,7 +1821,8 @@ def cmd_build(args):
         if hcode:
             for seg in cl_lines(pts):
                 ride_geoms.append(LineString(seg))
-                ride_meta.append({"code": hcode, "band": hband, "fam": hfam, "tags": t})
+                ride_meta.append({"code": hcode, "band": hband, "fam": hfam,
+                                  "tags": t, "id": e["id"]})
             continue
         code, kind = classify_way(t)
         if not code:
@@ -1606,6 +1836,21 @@ def cmd_build(args):
                 other_lines.append((code, seg))
     log(f"osm: {len(ride_geoms)} rideable lines, {len(other_lines)} other lines, "
         f"{len(areas)} areas, {len(points)} points")
+
+    measured = {}
+    # ---- measured riding speed (optional): a measurement outranks a tag guess
+    if cfg.get("speeds") and os.path.exists(cfg.get("speeds_json", "")):
+        sd = json.load(io.open(cfg["speeds_json"], encoding="utf-8"))
+        for meta in ride_meta:
+            w = sd["ways"].get(str(meta.get("id")))
+            if not w or meta["band"] is None:
+                continue
+            meta["measured"] = w["kmh"]
+            if w["band"] != meta["band"]:
+                measured[meta["id"]] = (meta["code"], w["code"], w["kmh"], w["n"])
+                meta["band"], meta["code"] = w["band"], code_for(meta["fam"], w["band"])
+        log(f"speed: {len(sd['ways'])} ways measured at {sd['p_ref_w']:.0f} W / "
+            f"{sd['v_ref_kmh']:.0f} km/h reference, {len(measured)} reclassified")
 
     # ---- heatmap merge (optional)
     new_lines, upgraded, matched_full, confirmed, heat_lines = [], [], 0, 0, []
@@ -1655,6 +1900,8 @@ def cmd_build(args):
             if cov < cfg["osm_confirmed"]:
                 continue
             confirmed += 1
+            if meta.get("measured") is not None and cfg.get("speed_overrides_heat", True):
+                continue                      # measured: do not also guess from usage
             if cfg["upgrade_confirmed"] and meta["band"] > FAST:
                 old, b = meta["code"], meta["band"]
                 meta["band"] = b - 1
@@ -1732,6 +1979,19 @@ def cmd_build(args):
             rep.append(f"  {k:<22} {n:>5}")
     if obj.missing:
         rep.append("Codes with no ISMTBOM equivalent (dropped): " + str(dict(obj.missing)))
+    if measured:
+        sd = json.load(io.open(cfg["speeds_json"], encoding="utf-8"))             if cfg.get("speeds") and os.path.exists(cfg.get("speeds_json", "")) else {}
+        rep += ["", f"Riding speed MEASURED from {len(sd.get('traces', []))} GPS "
+                    f"track(s): flat-equivalent speed at {sd.get('p_ref_w', 0):.0f} W "
+                    f"(the athlete's FTP), samples filtered to heart rate "
+                    f"{sd.get('hr_band', ['?', '?'])[0]}-{sd.get('hr_band', ['?', '?'])[1]} "
+                    f"bpm shifted back {sd.get('hr_lag_s', 0)} s. "
+                    f"{sd.get('v_ref_kmh', 0):.0f} km/h counts as a fast track.",
+                "ONE RIDER, a handful of days -- evidence, not a survey. Where a way was "
+                "measured the heatmap upgrade is suppressed.",
+                "", "Reclassified by measured speed (old -> new, km/h, samples):"]
+        rep += [f"  {o} -> {n}  {kmh:.1f} km/h  n={cnt}"
+                for (o, n, kmh, cnt) in measured.values()]
     rep += ["", f"Heat lines: {len(heat_lines)}  already mapped: {matched_full}  "
                 f"new: {len(new_lines)} ({n_track} x 815, {len(new_lines)-n_track} x 816)",
             f"OSM ways confirmed by heat: {confirmed}, upgraded one band: {len(upgraded)}",
@@ -1843,6 +2103,42 @@ def main():
     p.add_argument("--simplify-m", type=float, default=8.0)
     p.add_argument("--subtract-osm", type=int, default=1)
     p.set_defaults(func=cmd_vegetation)
+
+    p = sub.add_parser("speed")
+    p.add_argument("--config", default="project.json")
+    p.add_argument("--streams", nargs="+", required=True,
+                   help="activity stream JSON files (Strava MCP get_activity_streams "
+                        "output), globs allowed")
+    p.add_argument("--speeds-json")
+    p.add_argument("--v-ref", type=float, default=30.0,
+                   help="flat-equivalent km/h at the reference effort that counts "
+                        "as a good, fast track")
+    p.add_argument("--p-ref", type=float, default=228.0,
+                   help="reference power, W -- the athlete's FTP")
+    p.add_argument("--hr-lo", type=int, default=160, help="0 disables the heart-rate filter")
+    p.add_argument("--hr-hi", type=int, default=180)
+    p.add_argument("--hr-lag", type=int, default=25,
+                   help="seconds heart rate lags the effort that caused it")
+    p.add_argument("--bands", help="band thresholds in km/h, fast,medium,slow "
+                                   "(e.g. 20,10,5): at or above the first is a fast "
+                                   "track, below the last is very slow")
+    p.add_argument("--quantile", type=float, default=0.75,
+                   help="quantile of the matched samples: what the path permits, "
+                        "not what the rider averaged")
+    p.add_argument("--mass", type=float, default=85.0, help="rider + bike, kg")
+    p.add_argument("--crr", type=float, default=0.012,
+                   help="nominal rolling resistance, used only without a power meter")
+    p.add_argument("--cda", type=float, default=0.42)
+    p.add_argument("--crr-min", type=float, default=0.003)
+    p.add_argument("--crr-max", type=float, default=0.15)
+    p.add_argument("--min-watts", type=float, default=30.0)
+    p.add_argument("--min-kmh", type=float, default=3.0)
+    p.add_argument("--max-kmh", type=float, default=50.0)
+    p.add_argument("--match-m", type=float, default=12.0)
+    p.add_argument("--heading-deg", type=float, default=40.0)
+    p.add_argument("--min-pts", type=int, default=12)
+    p.add_argument("--min-traces", type=int, default=1)
+    p.set_defaults(func=cmd_speed)
 
     p = sub.add_parser("render")
     p.add_argument("--config", default="project.json")
