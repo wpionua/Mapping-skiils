@@ -134,6 +134,35 @@ python $S speed --config project.json \
     --v-ref 30 --bands 28,13.5,6 --p-ref 228 --hr-lo 160 --hr-hi 180
 ```
 
+**Prerequisites - the Strava MCP connector.** Settle these before promising the
+user anything:
+
+* a **paid Strava subscription**. The connector is subscriber-only.
+* it is **scoped to the athlete's own account** and read-only. Other riders' data
+  is not available through it at all - do not offer comparisons against anyone else.
+* install it once: `claude mcp add --transport http strava-mcp https://mcp.strava.com/mcp`,
+  then `/mcp` -> Authenticate. That leg is **the user's**: it opens Strava's OAuth
+  page in their browser and cannot be done for them. The tools only register after
+  the session restarts; until then `claude mcp list` says "Needs authentication".
+* call `eligibility` first. Its own message is the giveaway: "Start a new chat if
+  you only see the eligibility tool".
+* `get_athlete_zones` gives **FTP** (`--p-ref`) and the five heart-rate zones, so
+  the effort window can be set from the athlete's real physiology rather than a
+  guess - zone 4 to low zone 5 is the "hard but steady" band the method wants.
+* `get_activity_performance` reports `has_device_watts`: that is how you know
+  whether the full power inversion is available or only the gradient correction.
+
+**Finding the rides.** Most of an athlete's history is somewhere else entirely -
+300 activities yielded one ride in one of these maps and two in the other. List
+activities with `include_polyline`, decode each polyline and count points inside
+the map bbox; then pull streams only for the rides that hit. Ask for
+`["time", "location", "velocity_smooth", "grade_smooth", "moving", "heart_rate", "watts"]`
+in one go: it is easy to forget `watts` and then have to fetch everything twice.
+
+A stream response is far too big to read into context and the harness will spill it
+to a file - that is fine and in fact wanted. Copy that file straight to
+`data/streams/ride_<id>.json`; never try to summarise it.
+
 Input is one JSON file per ride holding Strava activity streams - `location`,
 `time`, `velocity_smooth`, `grade_smooth`, `moving`, and `heart_rate` and `watts`
 where they exist. The official **Strava MCP connector** produces exactly this from
