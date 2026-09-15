@@ -50,7 +50,7 @@ DEFAULTS = {
     "satellite_template": True,
     "contour_min_len_m": 45.0,
     # riding speed measured from GPS traces
-    "speeds_json": "data/speeds.json", "speeds": False,
+    "speeds_json": "data/speeds.json", "speeds": False, "tracks_dir": "",
     "speed_v_ref_kmh": 30.0, "speed_bands": [0.75, 0.45, 0.20],
     "speed_quantile": 0.75, "speed_hr_lo": 160, "speed_hr_hi": 180,
     "speed_hr_lag_s": 25, "speed_p_ref_w": 228.0,
@@ -222,6 +222,8 @@ def cmd_init(args):
     cfg["s2_npz"] = args.s2_npz
     cfg["vegetation_json"] = args.vegetation_json
     cfg["name"] = args.name or os.path.splitext(os.path.basename(args.out))[0]
+    if args.tracks_dir:
+        cfg["tracks_dir"] = args.tracks_dir.replace("\\", "/")
 
     if args.heatmap:
         from PIL import Image
@@ -1578,6 +1580,189 @@ def flat_speed(p, m, crr, cda):
     return (lo + hi) / 2
 
 
+def _localname(tag):
+    return tag.rpartition("}")[2]
+
+
+def _parse_time(s):
+    """GPX timestamps: ...Z, ...+02:00, with or without fractional seconds."""
+    import datetime
+    s = (s or "").strip()
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    if "." in s:                                  # trim fractional seconds
+        head, _, tail = s.partition(".")
+        keep = ""
+        for ch in tail:
+            if not ch.isdigit():
+                keep += ch
+        s = head + keep
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _haversine(a, b):
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * 6371000.0 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def read_gpx(path, smooth_ele=9, speed_win=2, grade_m=30.0, min_kmh=3.0, gap_s=10):
+    """GPX -> the same stream dict the Strava connector returns.
+
+    Heart rate and power come from the Garmin TrackPointExtension where the
+    device wrote them. Speed and grade have to be derived, and both are noisy at
+    1 Hz, so speed is taken over a centred +/-`speed_win` sample window and grade
+    over a `grade_m` horizontal window on a smoothed elevation profile. Grade is
+    the sensitive one: at 85 kg and 6 m/s a 1 % grade error is ~50 W, which lands
+    straight in the rolling-resistance inversion. Elevation from a barometric
+    device is usable; from a phone's GPS it is not.
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as ex:
+        log(f"  skip {os.path.basename(path)}: not parseable XML ({ex})")
+        return None
+    lat, lon, ele, tim, hr, pw = [], [], [], [], [], []
+    for trkpt in root.iter():
+        if _localname(trkpt.tag) != "trkpt":
+            continue
+        try:
+            la, lo = float(trkpt.get("lat")), float(trkpt.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        e = t = h = w = None
+        for node in trkpt.iter():
+            n = _localname(node.tag)
+            if n == "ele" and node.text:
+                try:
+                    e = float(node.text)
+                except ValueError:
+                    pass
+            elif n == "time" and node.text:
+                t = _parse_time(node.text)
+            elif n == "hr" and node.text:
+                try:
+                    h = int(float(node.text))
+                except ValueError:
+                    pass
+            elif n in ("PowerInWatts", "power", "watts") and node.text:
+                try:
+                    w = float(node.text)
+                except ValueError:
+                    pass
+        lat.append(la), lon.append(lo), ele.append(e), tim.append(t), hr.append(h), pw.append(w)
+    if len(lat) < 10:
+        log(f"  skip {os.path.basename(path)}: {len(lat)} points")
+        return None
+    if not any(t is not None for t in tim):
+        log(f"  skip {os.path.basename(path)}: no timestamps, so no speed")
+        return None
+
+    t0 = next(t for t in tim if t is not None)
+    secs = [None if t is None else (t - t0).total_seconds() for t in tim]
+    # smooth the elevation profile before any gradient is taken from it
+    known = [e for e in ele if e is not None]
+    if known:
+        fill, last = [], known[0]
+        for e in ele:
+            last = e if e is not None else last
+            fill.append(last)
+        half = smooth_ele // 2
+        sm = [sum(fill[max(0, i - half):i + half + 1])
+              / len(fill[max(0, i - half):i + half + 1]) for i in range(len(fill))]
+    else:
+        sm = [0.0] * len(lat)
+
+    n = len(lat)
+    vel, grd, mov = [0.0] * n, [0.0] * n, [False] * n
+    for i in range(n):
+        a, b = max(0, i - speed_win), min(n - 1, i + speed_win)
+        if secs[a] is None or secs[b] is None:
+            continue
+        dt = secs[b] - secs[a]
+        if dt <= 0 or dt > gap_s * (b - a + 1):        # a pause, not riding
+            continue
+        d = sum(_haversine((lat[k], lon[k]), (lat[k + 1], lon[k + 1])) for k in range(a, b))
+        vel[i] = d / dt
+        mov[i] = vel[i] * 3.6 >= min_kmh
+        # gradient over a fixed ground distance, not a fixed sample count
+        j, run = i, 0.0
+        while j + 1 < n and run < grade_m:
+            run += _haversine((lat[j], lon[j]), (lat[j + 1], lon[j + 1]))
+            j += 1
+        k, back = i, 0.0
+        while k > 0 and back < grade_m:
+            back += _haversine((lat[k - 1], lon[k - 1]), (lat[k], lon[k]))
+            k -= 1
+        if run + back > 5.0:
+            grd[i] = (sm[j] - sm[k]) / (run + back) * 100.0
+    return {"location": [[la, lo] for la, lo in zip(lat, lon)],
+            "time": [int(s) if s is not None else 0 for s in secs],
+            "altitude": sm, "velocity_smooth": vel, "grade_smooth": grd,
+            "moving": mov,
+            "heart_rate": hr if any(h is not None for h in hr) else None,
+            "watts": pw if any(w is not None for w in pw) else None}
+
+
+def load_tracks(specs, clip, frame, min_in_area=10, smooth_ele=9,
+                speed_win=2, grade_m=30.0):
+    """Every track in the given folders/files, keeping only those in the map.
+
+    A rider's archive is mostly elsewhere; this is what filters it down to the
+    area being mapped. Accepts .gpx and the JSON stream dicts the Strava MCP
+    connector returns, mixed freely.
+    """
+    from shapely.geometry import Point
+    paths = []
+    for spec in specs:
+        if os.path.isdir(spec):
+            for root, _dirs, files in os.walk(spec):
+                paths += [os.path.join(root, f) for f in sorted(files)
+                          if os.path.splitext(f)[1].lower() in (".gpx", ".json")]
+        else:
+            paths += sorted(glob.glob(spec)) if any(c in spec for c in "*?") else [spec]
+    log(f"{len(paths)} candidate track file(s)")
+    out, skipped = [], 0
+    for p in paths:
+        if os.path.splitext(p)[1].lower() == ".json":
+            try:
+                d = json.load(io.open(p, encoding="utf-8"))
+            except ValueError:
+                log(f"  skip {os.path.basename(p)}: not JSON")
+                continue
+            if "location" not in d:
+                log(f"  skip {os.path.basename(p)}: no location stream")
+                continue
+        else:
+            d = read_gpx(p, smooth_ele=smooth_ele, speed_win=speed_win,
+                         grade_m=grade_m)
+            if d is None:
+                continue
+        inside = 0
+        for la, lo in d["location"]:
+            x, y = frame.fwd(lo, la)
+            if clip.contains(Point(x, y)):
+                inside += 1
+                if inside >= min_in_area:
+                    break
+        if inside < min_in_area:
+            skipped += 1
+            continue
+        out.append((os.path.basename(p), d))
+        log(f"  {os.path.basename(p)}: {len(d['location'])} points, in the map"
+            + ("" if d.get("watts") else ", no power")
+            + ("" if d.get("heart_rate") else ", no heart rate"))
+    log(f"{len(out)} track(s) cross this map, {skipped} elsewhere")
+    return out
+
+
 def cmd_speed(args):
     from shapely.geometry import LineString, Point, box
     from shapely.strtree import STRtree
@@ -1619,19 +1804,12 @@ def cmd_speed(args):
     tree = STRtree(geoms)
     log(f"network: {len(geoms)} rideable ways inside the map")
 
-    # ---- samples
-    paths = []
-    for spec in (args.streams or []):
-        paths += sorted(glob.glob(spec)) if any(c in spec for c in "*?") else [spec]
-    streams = []
-    for p in paths:
-        d = json.load(io.open(p, encoding="utf-8"))
-        if "location" in d:
-            streams.append((os.path.basename(p), d))
-        else:
-            log(f"  skip {os.path.basename(p)}: no location stream")
+    # ---- the tracks that cross this map
+    streams = load_tracks(args.tracks or args.streams or [cfg.get("tracks_dir", "")],
+                          clip, frame, smooth_ele=args.ele_smooth,
+                          speed_win=args.speed_win, grade_m=args.grade_m)
     if not streams:
-        sys.exit("no usable stream files; pass --streams FILE_OR_GLOB")
+        sys.exit("no track crosses this map; check --tracks")
 
     per_way = collections.defaultdict(list)
     kept = unmatched = 0
@@ -2062,6 +2240,8 @@ def main():
     p.add_argument("--satellite-png", default="data/satellite.png")
     p.add_argument("--s2-npz", default="data/s2_stack.npz")
     p.add_argument("--vegetation-json", default="data/vegetation.json")
+    p.add_argument("--tracks-dir", help="folder of GPS tracks (.gpx) to take "
+                                       "riding speed from")
     p.add_argument("--name")
     p.set_defaults(func=cmd_init)
 
@@ -2106,9 +2286,17 @@ def main():
 
     p = sub.add_parser("speed")
     p.add_argument("--config", default="project.json")
-    p.add_argument("--streams", nargs="+", required=True,
-                   help="activity stream JSON files (Strava MCP get_activity_streams "
-                        "output), globs allowed")
+    p.add_argument("--tracks", nargs="+",
+                   help="folder(s) of GPS tracks, or single files/globs. .gpx and "
+                        "the JSON stream dicts the Strava MCP connector returns are "
+                        "both accepted; tracks outside the map are skipped")
+    p.add_argument("--streams", nargs="+", help="deprecated alias for --tracks")
+    p.add_argument("--ele-smooth", type=int, default=15,
+                   help="GPX only: elevation moving-average window, samples")
+    p.add_argument("--speed-win", type=int, default=3,
+                   help="GPX only: half-width of the speed window, samples")
+    p.add_argument("--grade-m", type=float, default=60.0,
+                   help="GPX only: ground distance the gradient is taken over")
     p.add_argument("--speeds-json")
     p.add_argument("--v-ref", type=float, default=30.0,
                    help="flat-equivalent km/h at the reference effort that counts "

@@ -1,6 +1,6 @@
 ---
 name: mtbo-base-map
-description: Build a base MTBO map (ISMTBOM 2022, 1:15 000) for an area from open data - OpenStreetMap for the path network and features, Copernicus DEM for 5 m contours, several dates of Sentinel-2 plus ESA WorldCover for vegetation, and optionally a Strava global-heatmap screenshot to confirm and extend the rides. The rider's own GPS tracks (Strava MCP activity streams) can replace the inferred riding-speed classes with measured ones: flat-equivalent speed at a reference power, solved through a cycling power model. Produces an OpenOrienteering Mapper .omap restricted to ISMTBOM 2022 symbols. Use when asked to make an MTBO map for a region, digitise a heatmap into a map, build a base/draft map from OSM, add contours, derive vegetation from satellite imagery, or classify paths by measured riding speed from Strava rides, power or heart-rate data.
+description: Build a base MTBO map (ISMTBOM 2022, 1:15 000) for an area from open data - OpenStreetMap for the path network and features, Copernicus DEM for 5 m contours, several dates of Sentinel-2 plus ESA WorldCover for vegetation, and optionally a Strava global-heatmap screenshot to confirm and extend the rides. A folder of the rider's own GPS tracks (.gpx, filtered to the map area automatically) can replace the inferred riding-speed classes with measured ones: flat-equivalent speed at a reference power, solved through a cycling power model from the track's speed, gradient, heart rate and power. Produces an OpenOrienteering Mapper .omap restricted to ISMTBOM 2022 symbols. Use when asked to make an MTBO map for a region, digitise a heatmap into a map, build a base/draft map from OSM, add contours, derive vegetation from satellite imagery, or classify paths by measured riding speed from a folder of GPX rides, power or heart-rate data.
 ---
 
 # OSM (+ Strava heatmap) -> ISMTBOM 2022 base map
@@ -34,10 +34,12 @@ Also settle, if the user has not said:
 * **contours** - yes/no and interval (default 5 m, index every 25 m);
 * **vegetation** - yes/no. It needs one summer and one winter satellite pass and
   gives 406 / 401 / 308 areas; without it the forest is plain white.
-* **own GPS tracks** - has the user ridden the area, and is the Strava MCP
-  connector available? Their rides turn the riding-speed classes from a tag guess
-  into a measurement (the `speed` step). Ask what speed counts as a good, fast
-  track - that one number anchors the whole 815-822 ladder.
+* **a folder of GPS tracks** - ask for the path to wherever the rider keeps
+  their `.gpx` files, the whole archive; `speed` filters it to this map by
+  itself, so they need not sort anything out first. Their own rides turn the
+  riding-speed classes from a tag guess into a measurement. Ask too what speed
+  counts as a good, fast track - that one number anchors the whole 815-822
+  ladder. Pass the folder to `init --tracks-dir`.
 * the **donor symbol set**: an ISMTBOM 2022 `.omap` at the target scale to take
   the colour table and symbols from. Mapper ships no ISMTBOM 2022 set
   ([issue #1107]), so this is usually a set produced by `mtbo-map-conversion`.
@@ -51,7 +53,8 @@ S=".claude/skills/mtbo-base-map/scripts/mtbo_base.py"
 
 python $S init --lat 49.8993 --lon 23.9866 \
     --heatmap data/heatmap.png --scalebar-m 100 \
-    --donor "ISMTBOM2022_15000.omap" --out "MTBO_area_15000.omap" --name "Area"
+    --donor "ISMTBOM2022_15000.omap" --out "MTBO_area_15000.omap" --name "Area" \
+    --tracks-dir "D:/rides"          # optional: the GPS track archive
 # no screenshot: --extent 3900x1900   (metres, instead of --heatmap)
 
 python $S fetch        # Overpass -> data/osm.json          (network)
@@ -59,7 +62,7 @@ python $S heatmap      # screenshot -> data/heatmap_network.json + overlay  (ski
 python $S contours     # Copernicus GLO-30 -> data/contours.json            (network)
 python $S imagery      # Sentinel-2, several dates -> data/satellite.png + s2_stack.npz
 python $S vegetation   # WorldCover + seasonal NDVI -> data/vegetation.json
-python $S speed        # GPS tracks -> data/speeds.json     (measured riding speed)
+python $S speed        # tracks folder -> data/speeds.json  (measured riding speed)
 python $S build        # -> the .omap, _report.txt, _merge_check.png
 python $S render       # -> _preview.png   (Mapper 0.9.x has no headless export)
 ```
@@ -129,46 +132,39 @@ The tag ladder above says what a path is *made of*; 815-822 record how fast you
 *ride* it. With the rider's own GPS tracks that stops being a guess.
 
 ```bash
-python $S speed --config project.json \
-    --streams data/streams/*.json \
+python $S speed --config project.json --tracks D:/rides \
     --v-ref 30 --bands 28,13.5,6 --p-ref 228 --hr-lo 160 --hr-hi 180
 ```
 
-**Prerequisites - the Strava MCP connector.** Settle these before promising the
-user anything:
+**Input is a folder of tracks**, pointed at with `--tracks` (or `tracks_dir` in
+the config, set by `init --tracks-dir`). Hand it the rider's whole archive: every
+`.gpx` under it is read, and those that do not cross this map are dropped, which
+is normally almost all of them. Files are also accepted individually or as globs,
+and the JSON stream dicts a Strava MCP connector returns work alongside `.gpx` in
+the same folder.
 
-* a **paid Strava subscription**. The connector is subscriber-only.
-* it is **scoped to the athlete's own account** and read-only. Other riders' data
-  is not available through it at all - do not offer comparisons against anyone else.
-* install it once: `claude mcp add --transport http strava-mcp https://mcp.strava.com/mcp`,
-  then `/mcp` -> Authenticate. That leg is **the user's**: it opens Strava's OAuth
-  page in their browser and cannot be done for them. The tools only register after
-  the session restarts; until then `claude mcp list` says "Needs authentication".
-* call `eligibility` first. Its own message is the giveaway: "Start a new chat if
-  you only see the eligibility tool".
-* `get_athlete_zones` gives **FTP** (`--p-ref`) and the five heart-rate zones, so
-  the effort window can be set from the athlete's real physiology rather than a
-  guess - zone 4 to low zone 5 is the "hard but steady" band the method wants.
-* `get_activity_performance` reports `has_device_watts`: that is how you know
-  whether the full power inversion is available or only the gradient correction.
+What each track needs, in order of how much it buys:
 
-**Finding the rides.** Most of an athlete's history is somewhere else entirely -
-300 activities yielded one ride in one of these maps and two in the other. List
-activities with `include_polyline`, decode each polyline and count points inside
-the map bbox; then pull streams only for the rides that hit. Ask for
-`["time", "location", "velocity_smooth", "grade_smooth", "moving", "heart_rate", "watts"]`
-in one go: it is easy to forget `watts` and then have to fetch everything twice.
+* **timestamps** - mandatory. A `.gpx` without `<time>` gives no speed and is
+  skipped, with a line saying so.
+* **elevation** (`<ele>`) - the gradient normalisation. Barometric is fine; a
+  phone's GPS altitude is not, and a bad profile is worse than none, because the
+  error lands straight in the rolling-resistance inversion.
+* **heart rate** (`<gpxtpx:hr>`) - the effort filter. Without it pass `--hr-lo 0`
+  and accept that how hard the rider was trying is no longer controlled.
+* **power** (`<gpxpx:PowerInWatts>`) - lets the model *solve* for the surface
+  instead of assuming it. This is what turns the step from a gradient correction
+  into a measurement.
 
-A stream response is far too big to read into context and the harness will spill it
-to a file - that is fine and in fact wanted. Copy that file straight to
-`data/streams/ride_<id>.json`; never try to summarise it.
-
-Input is one JSON file per ride holding Strava activity streams - `location`,
-`time`, `velocity_smooth`, `grade_smooth`, `moving`, and `heart_rate` and `watts`
-where they exist. The official **Strava MCP connector** produces exactly this from
-`get_activity_streams`; save each result to `data/streams/ride_<id>.json`. Find the
-rides that touch the map by listing activities with `include_polyline` and decoding
-the polyline against the map bbox - most of an athlete's rides will be elsewhere.
+**Speed and gradient have to be derived** from a `.gpx`, and both are noisy at
+1 Hz, so speed is taken over a centred +/-`--speed-win` sample window and gradient
+over `--grade-m` of ground distance on a profile smoothed with `--ele-smooth`.
+The defaults (3 / 60 m / 15) are not arbitrary: measured against the same rides
+delivered as pre-smoothed Strava streams, they cut the worst per-way disagreement
+from 10.5 to 5.2 km/h and lifted band agreement from 59 % to 76 %. Smoothing
+harder is *not* better - 120 m windows fell back to 65 %. Where a device already
+supplies smoothed speed and gradient that route stays the more accurate one;
+derived values are close, not identical.
 
 **What it computes.** Raw GPS speed conflates three things - the terrain, the
 gradient, and how hard the rider was trying. Remove the last two:
